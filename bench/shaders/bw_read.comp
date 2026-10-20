@@ -1,0 +1,20 @@
+#version 450
+// Streaming read bandwidth: every thread sums uvec4 loads in a grid-stride loop (the access shape of a decode GEMV
+// over quantized weights). One partial per thread is written so the loads cannot be dropped.
+layout(local_size_x_id = 0) in;
+layout(std430, set = 0, binding = 0) readonly buffer Src { uvec4 src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint dst[]; };
+layout(push_constant) uniform P { uint n_vec4; } p;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uvec4 acc = uvec4(0);
+    uint i = tid;
+    for (; i + 3u * stride < p.n_vec4; i += 4u * stride) {   // 4 independent loads in flight
+        uvec4 a = src[i], b = src[i + stride], c = src[i + 2u * stride], d = src[i + 3u * stride];
+        acc += a ^ b ^ c ^ d;
+    }
+    for (; i < p.n_vec4; i += stride) acc ^= src[i];
+    dst[tid] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+}

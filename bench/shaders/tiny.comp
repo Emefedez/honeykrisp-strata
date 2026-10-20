@@ -1,0 +1,7 @@
+#version 450
+// A near-empty dependent dispatch: one word read and written (the fixed cost of a small decode-window step).
+layout(local_size_x = 32) in;
+layout(std430, set = 0, binding = 0) buffer B { uint v[]; };
+void main() {
+    if (gl_GlobalInvocationID.x == 0u) v[0] = v[0] + 1u;
+}

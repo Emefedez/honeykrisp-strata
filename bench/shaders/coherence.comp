@@ -1,0 +1,57 @@
+#version 450
+#extension GL_KHR_memory_scope_semantics : require
+// The streaming arena's case: the host rewrites a slot while ONE command buffer is in flight, between two GPU
+// reads of the same bytes.  Thread 0 publishes "layer seq reached" and spins for the host's answer (as spin.comp);
+// then every thread reads the slot and counts words that are not the host's new pattern (stale cache lines).
+// flags: [0] gpu->host, [1] host->gpu, [2] spin timeouts, [3] stale words, [4] words checked
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) buffer F { uint flags[]; };
+layout(std430, set = 0, binding = 1) buffer S { uint slot[]; };
+layout(push_constant) uniform P { uint seq; uint max_iter; uint n_words; uint read_before; uint mode; } p;
+// mode 0: wait + acquire-load check in one dispatch; 1: wait only; 2: plain-load check only (the expert kernel's shape,
+// a separate dispatch after a barrier)
+
+shared uint ok;
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint tid = gl_GlobalInvocationID.x;
+    if (p.read_before != 0u) {   // pull the slot's old bytes into the GPU caches first
+        uint acc = 0u;
+        for (uint i = tid; i < p.n_words; i += stride) acc += slot[i];
+        if (acc == 0xdeadbeefu) flags[8] = acc;
+    }
+    if (p.mode == 2u) {
+        uint want = p.seq * 0x9e3779b9u, stale = 0u, seen = 0u;
+        for (uint i = tid; i < p.n_words; i += stride) { stale += (slot[i] != (want ^ i)) ? 1u : 0u; seen++; }
+        atomicAdd(flags[3], stale, gl_ScopeQueueFamily, 0, 0);
+        atomicAdd(flags[4], seen, gl_ScopeQueueFamily, 0, 0);
+        return;
+    }
+    if (gl_WorkGroupID.x == 0u && lid == 0u) {
+        atomicStore(flags[0], p.seq, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+        uint n = 0u;
+        while (atomicLoad(flags[1], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible) < p.seq) {
+            if (++n >= p.max_iter) { atomicAdd(flags[2], 1u, gl_ScopeQueueFamily, 0, 0); break; }
+        }
+    }
+    // other workgroups wait for workgroup 0 through the same flag (a grid-wide wait, as the engine's layer needs)
+    if (lid == 0u) {
+        uint n = 0u;
+        while (atomicLoad(flags[1], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible) < p.seq) {
+            if (++n >= p.max_iter) break;
+        }
+    }
+    barrier();
+    if (p.mode == 1u) return;
+    uint want = p.seq * 0x9e3779b9u;
+    uint stale = 0u, seen = 0u;
+    for (uint i = tid; i < p.n_words; i += stride) {
+        uint v = atomicLoad(slot[i], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible);
+        stale += (v != (want ^ i)) ? 1u : 0u;
+        seen++;
+    }
+    atomicAdd(flags[3], stale, gl_ScopeQueueFamily, 0, 0);
+    atomicAdd(flags[4], seen, gl_ScopeQueueFamily, 0, 0);
+}

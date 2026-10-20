@@ -1,0 +1,15 @@
+#version 450
+#extension GL_KHR_memory_scope_semantics : require
+// GPU-side handshake: publish "layer seq reached" to the host, then spin until the host answers with >= seq.
+// Bounded so a missed answer cannot hang the GPU (flags[2] counts timeouts).
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) buffer F { uint flags[]; };   // [0] gpu->host, [1] host->gpu, [2] timeouts
+layout(push_constant) uniform P { uint seq; uint max_iter; } p;
+
+void main() {
+    atomicStore(flags[0], p.seq, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+    uint n = 0u;
+    while (atomicLoad(flags[1], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible) < p.seq) {
+        if (++n >= p.max_iter) { atomicAdd(flags[2], 1u, gl_ScopeQueueFamily, 0, 0); break; }
+    }
+}
