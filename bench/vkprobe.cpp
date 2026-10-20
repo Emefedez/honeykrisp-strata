@@ -81,14 +81,19 @@ static Ctx init() {
     qci.queueFamilyIndex = c.qf;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    f11.storageBuffer16BitAccess = VK_TRUE;
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11};
+    f12.shaderInt8 = VK_TRUE;
     f12.timelineSemaphore = VK_TRUE;
     f12.vulkanMemoryModel = VK_TRUE;
     f12.vulkanMemoryModelDeviceScope = VK_TRUE;
     f12.hostQueryReset = VK_TRUE;
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12};
     f13.synchronization2 = VK_TRUE;
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f13};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
+    f2.features.shaderInt16 = VK_TRUE;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     CK(vkCreateDevice(c.pd, &dci, nullptr, &c.dev));
@@ -281,6 +286,44 @@ static void test_bw(Ctx& c, size_t mib) {
                 submit_wait(c, cb);
                 double ms = (now_us() - t0) / 1000.0 / D;
                 if (rep) best = std::min(best, ms);   // rep 0 warms caches/pipeline
+            }
+            vkFreeCommandBuffers(c.dev, c.pool, 1, &cb);
+            printf("  %5u:%6.1f", groups, (double) src.size / (best * 1e6));
+        }
+        printf("\n");
+        destroy_pipe(c, p);
+    }
+    free_buf(c, src);
+    free_buf(c, dst);
+}
+
+// The Q2_0 GEMV's access pattern without its arithmetic (bw_q2.comp): GB/s of weight bytes (18 per 64 weights).
+static void test_bw_q2(Ctx& c, size_t mib) {
+    Buf src = make_buf(c, (VkDeviceSize) mib << 20);
+    memset(src.p, 0x5a, src.size);
+    const uint32_t max_threads = 1u << 20;
+    Buf dst = make_buf(c, max_threads * 4ull);
+    const uint32_t n_units = (uint32_t) (src.size / 18 * 4);
+    printf("\n[bw_q2] %zu MiB of Q2_0 blocks read as the GEMV reads them (16-bit loads), GB/s\n", mib);
+    for (uint32_t wg : {128u, 256u}) {
+        Pipe p = make_pipe(c, "bw_q2", {&src, &dst}, 4, wg);
+        printf("  wg %4u:", wg);
+        for (uint32_t groups : {64u, 256u, 1024u, 4096u}) {
+            if ((uint64_t) groups * wg > max_threads) { printf("        -"); continue; }
+            double best = 1e30;
+            const int D = 8;
+            VkCommandBuffer cb = new_cb(c);
+            begin(cb);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.p);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.l, 0, 1, &p.ds, 0, nullptr);
+            vkCmdPushConstants(cb, p.l, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n_units);
+            for (int d = 0; d < D; d++) { vkCmdDispatch(cb, groups, 1, 1); barrier(cb); }
+            CK(vkEndCommandBuffer(cb));
+            for (int rep = 0; rep < 6; rep++) {
+                double t0 = now_us();
+                submit_wait(c, cb);
+                double ms = (now_us() - t0) / 1000.0 / D;
+                if (rep) best = std::min(best, ms);
             }
             vkFreeCommandBuffers(c.dev, c.pool, 1, &cb);
             printf("  %5u:%6.1f", groups, (double) src.size / (best * 1e6));
@@ -566,6 +609,7 @@ int main(int argc, char** argv) {
     for (auto& t : tests) {
         if (t == "bw") test_bw(c, mib);
         else if (t == "dispatch") test_dispatch(c);
+        else if (t == "bw_q2") test_bw_q2(c, mib);
         else if (t == "rt") {
             test_rt_submit(c, 48);
             test_rt_timeline(c, 48, false);

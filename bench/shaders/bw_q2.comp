@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+// The Q2_0 GEMV's memory access with no decode: per unit (4 bytes inside an 18-byte block) two 16-bit loads plus
+// the block's 16-bit scale; units in a grid-stride loop (consecutive lanes read consecutive units, as LPR lanes of
+// a row do). MODE 0: 16-bit loads (as the kernel); MODE 1: the unit's 4 bytes as one 32-bit load when 4-aligned.
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const int MODE = 0;
+layout(std430, set = 0, binding = 0) readonly buffer Src16 { uint16_t w16[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint dst[]; };
+layout(push_constant) uniform P { uint n_units; } p;
+void main() {
+    uint tid = gl_GlobalInvocationID.x, stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint acc = 0u;
+    for (uint u = tid; u < p.n_units; u += stride) {
+        uint blk = u >> 2, ui = u & 3u;
+        uint h = blk * 9u;                       // 18 bytes = 9 halfwords
+        uint a = uint(w16[h + 1u + 2u * ui]), c = uint(w16[h + 2u + 2u * ui]);
+        uint d = uint(w16[h]);
+        acc += a ^ (c << 3) ^ d;
+    }
+    dst[tid] = acc;
+}
