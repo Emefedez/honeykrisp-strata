@@ -1,0 +1,120 @@
+#version 450
+// bw_width.comp - what the driver does with narrow loads: GB/s of USEFUL weight bytes per load width.
+//
+// MODE 0: uvec4 loads, 16 useful bytes a lane (the bw_read baseline)
+// MODE 1: uvec2 loads, 8 useful bytes a lane
+// MODE 2: uint loads, 4 useful bytes a lane
+// MODE 3: ushort loads, 2 useful bytes a lane
+// MODE 4: uvec4 load of the 16-byte chunk that holds a 4-byte piece at offset 2 of the chunk (the Q2_0 unit's
+//         codes: 4 useful bytes a lane, the chunk's other 12 bytes are other units' codes)
+// MODE 5: the same with the piece at offset 0 of the chunk (4 useful bytes a lane)
+// MODE 6: uvec4 load of the chunk that holds a 2-byte piece (the Q2_0 block's scale: 2 useful bytes a lane)
+// MODE 7: uvec4 loads of the Q2_0 block's 16 code bytes (2 chunks a block: 32 fetched, 16 useful)
+//
+// Every mode walks the buffer in a grid-stride loop with 4 loads in flight (the bw_read shape).
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const int MODE = 0;
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint dst[]; };
+layout(push_constant) uniform P { uint n_items; } p;
+
+uint piece4(uint i) {          // the 4 bytes of unit i in the Q2_0 layout (18 bytes a block, 4 units a block)
+    return src[(i >> 2) * 18 / 4 + (2 + 4 * (i & 3u)) / 4];
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint acc = 0u;
+    uint i = tid;
+    if (MODE == 0) {
+        for (; i + 3u * stride < p.n_items; i += 4u * stride) {
+            uvec4 a = uvec4(src[4u * i], src[4u * i + 1], src[4u * i + 2], src[4u * i + 3]);
+            uvec4 b = uvec4(src[4u * (i + stride)], src[4u * (i + stride) + 1], src[4u * (i + stride) + 2], src[4u * (i + stride) + 3]);
+            uvec4 c = uvec4(src[4u * (i + 2u * stride)], src[4u * (i + 2u * stride) + 1], src[4u * (i + 2u * stride) + 2], src[4u * (i + 2u * stride) + 3]);
+            uvec4 d = uvec4(src[4u * (i + 3u * stride)], src[4u * (i + 3u * stride) + 1], src[4u * (i + 3u * stride) + 2], src[4u * (i + 3u * stride) + 3]);
+            acc += a.x ^ b.y ^ c.z ^ d.w;
+        }
+    } else if (MODE == 1) {
+        for (; i + 3u * stride < p.n_items; i += 4u * stride) {
+            uvec2 a = uvec2(src[2u * i], src[2u * i + 1]);
+            uvec2 b = uvec2(src[2u * (i + stride)], src[2u * (i + stride) + 1]);
+            uvec2 c = uvec2(src[2u * (i + 2u * stride)], src[2u * (i + 2u * stride) + 1]);
+            uvec2 d = uvec2(src[2u * (i + 3u * stride)], src[2u * (i + 3u * stride) + 1]);
+            acc += a.x ^ b.y ^ c.x ^ d.y;
+        }
+    } else if (MODE == 2) {
+        for (; i + 3u * stride < p.n_items; i += 4u * stride) {
+            uint a = src[i], b = src[i + stride], c = src[i + 2u * stride], d = src[i + 3u * stride];
+            acc += a ^ b ^ c ^ d;
+        }
+    } else if (MODE == 3) {
+        for (; i + 3u * stride < p.n_items; i += 4u * stride) {
+            uint a = src[2u * i] & 0xFFFFu, b = src[2u * (i + stride)] & 0xFFFFu;
+            uint c = src[2u * (i + 2u * stride)] & 0xFFFFu, d = src[2u * (i + 3u * stride)] & 0xFFFFu;
+            acc += a ^ b ^ c ^ d;
+        }
+    } else if (MODE == 4 || MODE == 5) {
+        // the 4-byte piece of unit i, read as the 16-byte chunk that holds it
+        for (; i + 3u * stride < p.n_items; i += 4u * stride) {
+            uint o0 = (2u + 4u * i) & ~3u, o1 = (2u + 4u * (i + stride)) & ~3u;
+            uint o2 = (2u + 4u * (i + 2u * stride)) & ~3u, o3 = (2u + 4u * (i + 3u * stride)) & ~3u;
+            if (MODE == 5) { o0 &= ~15u; o1 &= ~15u; o2 &= ~15u; o3 &= ~15u; }
+            uvec4 a = uvec4(src[o0 / 4], src[o0 / 4 + 1], src[o0 / 4 + 2], src[o0 / 4 + 3]);
+            uvec4 b = uvec4(src[o1 / 4], src[o1 / 4 + 1], src[o1 / 4 + 2], src[o1 / 4 + 3]);
+            uvec4 c = uvec4(src[o2 / 4], src[o2 / 4 + 1], src[o2 / 4 + 2], src[o2 / 4 + 3]);
+            uvec4 d = uvec4(src[o3 / 4], src[o3 / 4 + 1], src[o3 / 4 + 2], src[o3 / 4 + 3]);
+            acc += a.x ^ b.y ^ c.z ^ d.w;
+        }
+    } else if (MODE == 6) {
+        // the 2-byte scale of block i/4, read as the chunk that holds it
+        for (; i + 3u * stride < p.n_items; i += 4u * stride) {
+            uint o0 = ((i >> 2) * 18u) & ~15u, o1 = (((i + stride) >> 2) * 18u) & ~15u;
+            uint o2 = (((i + 2u * stride) >> 2) * 18u) & ~15u, o3 = (((i + 3u * stride) >> 2) * 18u) & ~15u;
+            uvec4 a = uvec4(src[o0 / 4], src[o0 / 4 + 1], src[o0 / 4 + 2], src[o0 / 4 + 3]);
+            uvec4 b = uvec4(src[o1 / 4], src[o1 / 4 + 1], src[o1 / 4 + 2], src[o1 / 4 + 3]);
+            uvec4 c = uvec4(src[o2 / 4], src[o2 / 4 + 1], src[o2 / 4 + 2], src[o2 / 4 + 3]);
+            uvec4 d = uvec4(src[o3 / 4], src[o3 / 4 + 1], src[o3 / 4 + 2], src[o3 / 4 + 3]);
+            acc += a.x ^ b.y ^ c.z ^ d.w;
+        }
+    } else if (MODE == 8) {
+        // the Q2_0 pattern with 4-byte-aligned 32-bit loads: a unit's 4 code bytes are read as the aligned word
+        // they sit in (two of them when the unit starts at +2 of a word) and the block's scale as the aligned word
+        // it sits in.  5 words a block of 4 units, 18 useful bytes.
+        for (; i + 3u * stride < p.n_items; i += 4u * stride) {
+            uint o[4];
+            for (int k = 0; k < 4; k++) {
+                const uint u = i + k * stride;
+                o[k] = ((u >> 2) * 18u + 2u + 4u * (u & 3u));
+            }
+            uint acc2 = 0u;
+            for (int k = 0; k < 4; k++) {
+                const uint off = o[k];
+                const uint w0 = src[off / 4u];
+                const uint w1 = src[off / 4u + 1u];
+                const uint sh = (off & 3u) * 8u;
+                const uint code = (w0 >> sh) | (sh != 0u ? (w1 << (32u - sh)) : 0u);
+                const uint soff = (i + k * stride) >> 2 * 18u;
+                acc2 += code ^ (src[soff / 4u] >> ((soff & 3u) * 8u));
+            }
+            acc += acc2;
+        }
+    } else {
+        // the 16 code bytes of block i/4: two chunks (32 bytes fetched, 16 useful)
+        for (; i + 3u * stride < p.n_items; i += 4u * stride) {
+            uint b0 = (i >> 2) * 18u, b1 = ((i + stride) >> 2) * 18u;
+            uint b2 = ((i + 2u * stride) >> 2) * 18u, b3 = ((i + 3u * stride) >> 2) * 18u;
+            uvec4 a = uvec4(src[b0 / 4], src[b0 / 4 + 1], src[b0 / 4 + 2], src[b0 / 4 + 3]);
+            uvec4 b = uvec4(src[(b0 + 16u) / 4], src[(b0 + 16u) / 4 + 1], src[(b0 + 16u) / 4 + 2], src[(b0 + 16u) / 4 + 3]);
+            uvec4 c = uvec4(src[b1 / 4], src[b1 / 4 + 1], src[b1 / 4 + 2], src[b1 / 4 + 3]);
+            uvec4 d = uvec4(src[(b1 + 16u) / 4], src[(b1 + 16u) / 4 + 1], src[(b1 + 16u) / 4 + 2], src[(b1 + 16u) / 4 + 3]);
+            uvec4 e = uvec4(src[b2 / 4], src[b2 / 4 + 1], src[b2 / 4 + 2], src[b2 / 4 + 3]);
+            uvec4 f = uvec4(src[(b2 + 16u) / 4], src[(b2 + 16u) / 4 + 1], src[(b2 + 16u) / 4 + 2], src[(b2 + 16u) / 4 + 3]);
+            uvec4 g = uvec4(src[b3 / 4], src[b3 / 4 + 1], src[b3 / 4 + 2], src[b3 / 4 + 3]);
+            uvec4 h = uvec4(src[(b3 + 16u) / 4], src[(b3 + 16u) / 4 + 1], src[(b3 + 16u) / 4 + 2], src[(b3 + 16u) / 4 + 3]);
+            acc += a.x ^ b.y ^ c.z ^ d.w ^ e.x ^ f.y ^ g.z ^ h.w;
+        }
+    }
+    for (; i < p.n_items; i += stride) acc ^= src[i];
+    dst[tid] = acc;
+}

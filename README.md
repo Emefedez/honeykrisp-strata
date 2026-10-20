@@ -47,6 +47,13 @@ Notes:
 LUKS costs nothing at expert-sized reads. Btrfs costs 4-7%; `chattr +C` on a model directory could recover that,
 but it is not measured yet. For comparison, upstream measured 2.97 GB/s on the 32 GB M4 mini under macOS.
 
+## Load width (2026-10-20)
+
+`bench/bw_width` reads 512 MiB with one load width and counts the useful bytes: **16-byte and 4-byte loads reach the
+DRAM bandwidth (288-292 GB/s), a 2-byte load a quarter of it (67-71 GB/s)**. A 4-byte load may sit at any 2-byte
+aligned address. So the port's weight reads must be 4 bytes wide or more, and 16-byte loads buy nothing. The numbers
+and the commands are in [bench/RESULTS.md](bench/RESULTS.md).
+
 ## What this means for the port
 
 1. **The per-layer handshake** (the router's choice goes to the host, the host reads the missing experts, then the
@@ -57,7 +64,9 @@ but it is not measured yet. For comparison, upstream measured 2.97 GB/s on the 3
    `mlock`, as upstream does after its freeze reports.
 3. **Kernels**: read bandwidth is ~80% of the 400 GB/s peak. Prompt GEMMs use the v3 cooperative matrices; Metal's
    `simdgroup_matrix` is 8x8 too. The Mesa compiler's codegen versus Apple's is the open question. It is measured
-   per kernel as each one is ported: parity first, then GB/s.
+   per kernel as each one is ported: parity first, then GB/s. The dense GEMV turned out not to be bandwidth-bound
+   (its weight reads alone reach 322 GB/s against the kernel's 163): the loads and the arithmetic do not overlap,
+   so prefetching the next unit's weights is the lever there.
 4. **SSD**: Asahi's NVMe is faster than the M4's. The experts' contiguous copy (one read per expert) matters more
    than the encryption does.
 

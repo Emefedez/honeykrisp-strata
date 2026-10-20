@@ -335,6 +335,113 @@ static void test_bw_q2(Ctx& c, size_t mib) {
     free_buf(c, dst);
 }
 
+
+// A pipeline with extra specialization constants (ids 1..): the workgroup size is always id 0.
+static Pipe make_pipe_sc(Ctx& c, const char* name, std::vector<Buf*> bufs, uint32_t push_bytes, uint32_t wg,
+                          const std::vector<int32_t>& extra) {
+    Pipe p;
+    std::vector<VkDescriptorSetLayoutBinding> bs;
+    for (uint32_t i = 0; i < bufs.size(); i++)
+        bs.push_back({i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dli.bindingCount = (uint32_t) bs.size();
+    dli.pBindings = bs.data();
+    CK(vkCreateDescriptorSetLayout(c.dev, &dli, nullptr, &p.dsl));
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &p.dsl;
+    pli.pushConstantRangeCount = push_bytes ? 1 : 0;
+    pli.pPushConstantRanges = &pcr;
+    CK(vkCreatePipelineLayout(c.dev, &pli, nullptr, &p.l));
+    auto spv = load_spv(name);
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = spv.size() * 4;
+    smi.pCode = spv.data();
+    VkShaderModule sm;
+    CK(vkCreateShaderModule(c.dev, &smi, nullptr, &sm));
+    std::vector<VkSpecializationMapEntry> me;
+    std::vector<int32_t> vals;
+    me.push_back({0, 0, 4});
+    vals.push_back((int32_t) wg);
+    for (size_t i = 0; i < extra.size(); i++) {
+        me.push_back({(uint32_t) (i + 1), (uint32_t) ((i + 1) * sizeof(int32_t)), sizeof(int32_t)});
+        vals.push_back(extra[i]);
+    }
+    VkSpecializationInfo si{(uint32_t) me.size(), me.data(), vals.size() * sizeof(int32_t), vals.data()};
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main",
+                 &si};
+    cpi.layout = p.l;
+    CK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &p.p));
+    vkDestroyShaderModule(c.dev, sm, nullptr);
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = c.dpool;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &p.dsl;
+    CK(vkAllocateDescriptorSets(c.dev, &dai, &p.ds));
+    std::vector<VkDescriptorBufferInfo> bis;
+    for (auto* b : bufs) bis.push_back({b->b, 0, VK_WHOLE_SIZE});
+    std::vector<VkWriteDescriptorSet> ws;
+    for (uint32_t i = 0; i < bufs.size(); i++) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = p.ds;
+        w.dstBinding = i;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bis[i];
+        ws.push_back(w);
+    }
+    vkUpdateDescriptorSets(c.dev, (uint32_t) ws.size(), ws.data(), 0, nullptr);
+    return p;
+}
+
+// bw_width: GB/s of useful weight bytes per load width (MODE 0..8 in bw_width.comp).
+static void test_bw_width(Ctx& c, size_t mib) {
+    Buf src = make_buf(c, (VkDeviceSize) mib << 20);
+    memset(src.p, 0x5a, src.size);
+    const uint32_t max_threads = 1u << 20;
+    Buf dst = make_buf(c, max_threads * 4ull);
+    const char* names[] = {"16B loads (uvec4)", "8B loads (uint2)", "4B loads (uint)", "2B loads (ushort)",
+                           "16B load, 4B used (piece at 2)", "16B load, 4B used (piece at 0)",
+                           "16B load, 2B used (the scale)", "16B load, block's 16 code bytes",
+                           "Q2_0 with 4-byte-aligned loads"};
+    const double useful[] = {16, 8, 4, 2, 4, 4, 2, 16, 4.5};
+    printf("\n[bw_width] %zu MiB read, GB/s of USEFUL bytes\n", mib);
+    for (int mode = 0; mode < 9; mode++) {
+        uint32_t n_items = (uint32_t) (src.size / 64);   // the items are 64 bytes apart; the mode maps them
+        printf("  %-34s", names[mode]);
+        for (uint32_t groups : {256u, 1024u, 4096u}) {
+            const uint32_t wg = 256;
+            if ((uint64_t) groups * wg > max_threads) { printf("     -"); continue; }
+            Pipe p = make_pipe_sc(c, "bw_width", {&src, &dst}, 4, wg, {mode});
+            const int D = 8;
+            VkCommandBuffer cb = new_cb(c);
+            begin(cb);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.p);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.l, 0, 1, &p.ds, 0, nullptr);
+            vkCmdPushConstants(cb, p.l, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n_items);
+            for (int d = 0; d < D; d++) { vkCmdDispatch(cb, groups, 1, 1); barrier(cb); }
+            CK(vkEndCommandBuffer(cb));
+            double best = 1e30;
+            for (int rep = 0; rep < 6; rep++) {
+                double t0 = now_us();
+                submit_wait(c, cb);
+                double ms = (now_us() - t0) / 1000.0 / D;
+                if (rep) best = std::min(best, ms);
+            }
+            vkFreeCommandBuffers(c.dev, c.pool, 1, &cb);
+            destroy_pipe(c, p);
+            // the useful bytes of one dispatch: n_items items of useful[mode] bytes (best is per dispatch)
+            const double useful_bytes = (double) n_items * useful[mode];
+            printf("  %6.1f", useful_bytes / (best * 1e6));
+        }
+        printf("   GB/s\n");
+    }
+    free_buf(c, src);
+    free_buf(c, dst);
+}
+
 static void test_dispatch(Ctx& c) {
     Buf b = make_buf(c, 4096);
     Pipe p = make_pipe(c, "tiny", {&b}, 0);
@@ -610,6 +717,7 @@ int main(int argc, char** argv) {
         if (t == "bw") test_bw(c, mib);
         else if (t == "dispatch") test_dispatch(c);
         else if (t == "bw_q2") test_bw_q2(c, mib);
+        else if (t == "bw_width") test_bw_width(c, mib);
         else if (t == "rt") {
             test_rt_submit(c, 48);
             test_rt_timeline(c, 48, false);
