@@ -13,6 +13,12 @@ Linux. The port replaces Metal with Vulkan.
   - `patches/` adds this repo's changes on top; it is empty so far.
 - `bench/vkprobe`: GPU probes. `bench/ssdprobe`: expert-streaming read throughput.
 
+Build: `./build-icd.sh` clones the base into `./mesa` on first use (`SRC=<path>` builds an existing checkout; it
+stops if that checkout has uncommitted changes) and installs into `~/.local/lib/honeykrisp-strata/v3`.
+
+Used by [strata-asahi](https://github.com/Emefedez/strata-asahi) (the Vulkan engine) and
+[lmdeck-de](https://github.com/Emefedez/lmdeck-de), whose Backends screen builds it when Strata needs it.
+
 ## Measured (M1 Max 32 GB, Asahi, Linux 7.1.12, 2026-10-20)
 
 Three drivers: the system Mesa 26.2.4, omarchy-mlx-vulkan 0.7.28's private ICD (`e7631595df`, 2026-10-01), and

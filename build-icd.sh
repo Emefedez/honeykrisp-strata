@@ -14,8 +14,9 @@ set -euo pipefail
 BASE_REPO=${BASE_REPO:-https://github.com/joshuaswarren/mesa-1}
 BASE_BRANCH=${BASE_BRANCH:-honeykrisp-omarchy-v3}
 BASE_SHA=${BASE_SHA:-f144c7949b}
-SRC=${SRC:-$HOME/Work/mesa-hk}
 HERE=$(cd "$(dirname "$0")" && pwd)
+# The Mesa checkout (cloned on first use; SRC=<path> builds an existing one)
+SRC=${SRC:-$HERE/mesa}
 NAME=${NAME:-v3}
 PREFIX=${PREFIX:-$HOME/.local/lib/honeykrisp-strata/$NAME}
 
@@ -23,6 +24,11 @@ if [ ! -d "$SRC/.git" ]; then
     git clone --depth 50 -b "$BASE_BRANCH" "$BASE_REPO" "$SRC"
 fi
 cd "$SRC"
+# The build resets the checkout's "strata" branch: never over uncommitted work.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "$SRC has uncommitted changes; commit or stash them first" >&2
+    exit 1
+fi
 git fetch --depth 50 origin "$BASE_BRANCH"
 git checkout -q -B strata "$BASE_SHA"
 shopt -s nullglob

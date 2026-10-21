@@ -49,7 +49,7 @@ The last row of the table, the block's 16 code bytes read as two 16-byte chunks,
 
 The kernel's own pattern is the fastest of the six: the 4-byte read of the codes and the 2-byte read of the scale (one
 a block) are not the problem. The Strata side's results and what to do next are in
-`~/Work/strata-src/Strata/vulkan/RESULTS.md`.
+[strata-asahi's vulkan/RESULTS.md](https://github.com/Emefedez/strata-asahi/blob/vulkan-asahi/vulkan/RESULTS.md).
 
 ## What was tried and dropped
 
